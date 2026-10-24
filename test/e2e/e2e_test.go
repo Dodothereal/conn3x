@@ -62,8 +62,22 @@ func startHost(t *testing.T, image string) *host {
 	tag := "localhost/conn3x-e2e-" + image
 	run(t, "podman", "build", "-q", "-t", tag, imageDir)
 
-	id := strings.TrimSpace(run(t, "podman", "run", "-d", "--rm", "--systemd=always", "-p", "127.0.0.1::22", tag))
-	t.Cleanup(func() { _ = exec.Command("podman", "rm", "-f", id).Run() })
+	// Podman's default capabilities differ between versions. A real host's
+	// root can read /etc/shadow (DAC_OVERRIDE) and write audit records, and
+	// PAM needs both to let non-root users log in, so grant them explicitly.
+	id := strings.TrimSpace(run(t, "podman", "run", "-d", "--rm", "--systemd=always",
+		"--cap-add", "DAC_OVERRIDE,AUDIT_WRITE", "-p", "127.0.0.1::22", tag))
+	t.Cleanup(func() {
+		if t.Failed() {
+			// Show what sshd and the rest of the host logged, to explain the failure.
+			out, _ := exec.Command("podman", "exec", id, "journalctl", "--no-pager", "-n", "80").CombinedOutput()
+			t.Logf("journal from %s:\n%s", image, out)
+			diag, _ := exec.Command("podman", "exec", id, "sh", "-c",
+				"ls -ln /etc/shadow /etc/passwd /usr/sbin/unix_chkpwd; grep -E '^Cap(Eff|Bnd)' /proc/self/status; cat /proc/self/uid_map").CombinedOutput()
+			t.Logf("host details:\n%s", diag)
+		}
+		_ = exec.Command("podman", "rm", "-f", id).Run()
+	})
 	mapping := strings.TrimSpace(run(t, "podman", "port", id, "22/tcp"))
 	h := &host{t: t, container: id, port: mapping[strings.LastIndex(mapping, ":")+1:]}
 
@@ -79,6 +93,10 @@ func startHost(t *testing.T, image string) *host {
 	}
 	signer, _ := gossh.NewSignerFromKey(priv)
 	h.exec(string(gossh.MarshalAuthorizedKey(signer.PublicKey())), "sh", "-c", "cat > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys")
+
+	// Let systemd finish booting first: services that start late can
+	// restart sshd and drop a connection mid-handshake.
+	_ = exec.Command("podman", "exec", id, "timeout", "60", "systemctl", "is-system-running", "--wait").Run()
 
 	// Wait for sshd, then record its key the way an admin would.
 	var keys string
