@@ -35,6 +35,12 @@ func TestAuthorizedKeyLetsTheUserLogIn(t *testing.T) {
 			if got := strings.TrimSpace(h.exec("", "stat", "-c", "%a %U", "/home/carol/.ssh", "/home/carol/.ssh/authorized_keys")); got != "700 carol\n600 carol" {
 				t.Fatalf("modes = %q", got)
 			}
+			// Rootless CI containers can't run PAM's account check, so sshd
+			// would refuse any non-root login; real hosts are covered by the
+			// droplet suite's deploy user.
+			// Without PAM, sshd also refuses accounts that have no password at
+			// all, as useradd leaves them; "*" marks "no usable password".
+			h.exec("", "sh", "-c", "usermod -p '*' carol && echo 'UsePAM no' > /etc/ssh/sshd_config.d/00-conn3x-test.conf && (systemctl restart sshd 2>/dev/null || systemctl restart ssh)")
 			hostKeys, err := knownhosts.New(h.knownHosts)
 			if err != nil {
 				t.Fatal(err)
@@ -43,7 +49,9 @@ func TestAuthorizedKeyLetsTheUserLogIn(t *testing.T) {
 				User:            "carol",
 				Auth:            []gossh.AuthMethod{gossh.PublicKeys(signer)},
 				HostKeyCallback: hostKeys,
-				Timeout:         10 * time.Second,
+				// known_hosts only records the ed25519 key, so ask for that one.
+				HostKeyAlgorithms: []string{gossh.KeyAlgoED25519},
+				Timeout:           10 * time.Second,
 			})
 			if err != nil {
 				t.Fatalf("carol can't log in with the installed key: %v", err)
